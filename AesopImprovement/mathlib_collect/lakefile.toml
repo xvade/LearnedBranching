@@ -1,0 +1,14 @@
+name = "mathlib_collect"
+
+# Mathlib from the NeuralTactic build tree (already compiled, no re-download).
+[[require]]
+name = "mathlib"
+path = "../../NeuralTactic/.lake/packages/mathlib"
+
+# Our aesop_collect fork, as a PATH dependency.
+# Lake uses the first matching name when resolving transitive deps, so this
+# overrides the upstream `aesop` package that Mathlib would otherwise pull in.
+# That makes `aesop_collect` available alongside all of Mathlib's rule sets.
+[[require]]
+name = "aesop"
+path = "../aesop_collect"
