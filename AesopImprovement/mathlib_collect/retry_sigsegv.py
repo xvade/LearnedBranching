@@ -31,15 +31,12 @@ from pathlib import Path
 HERE = Path(__file__).parent.resolve()
 sys.path.insert(0, str(HERE))
 
-from collect_mathlib_aesop import (
-    AESOP_CALL_RE,
-    strip_comments_mask,
-    _looks_like_tactic,
-)
 from collect_by_file import (
     scan_declarations,
     patch_all_aesop,
     parse_aesop_collect_messages,
+    patch_range_only,
+    find_decl_end,
 )
 
 MATHLIB_DEFAULT = str(HERE / "../../NeuralTactic/.lake/packages/mathlib")
@@ -50,36 +47,6 @@ STACK_KB_BIG = 524288  # 512 MB — for crashes that survive 64 MB
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-def patch_range_only(source: str, start_line: int, end_line: int) -> str:
-    """
-    Replace tactic-position `aesop` with `aesop_collect` only in lines
-    [start_line, end_line] (1-based, inclusive).  Lines outside the range
-    are left as original plain `aesop`.
-    """
-    lines  = source.splitlines(keepends=True)
-    masked = strip_comments_mask(lines)
-
-    for i, (raw, code) in enumerate(zip(lines, masked)):
-        lineno = i + 1
-        if lineno < start_line or lineno > end_line:
-            continue
-        matches = [
-            m for m in AESOP_CALL_RE.finditer(code)
-            if not code[:m.start()].rstrip().endswith(("@[", ","))
-            and _looks_like_tactic(code, m.start())
-        ]
-        if not matches:
-            continue
-        new_raw = raw
-        for m in reversed(matches):
-            orig    = new_raw[m.start():m.end()]
-            new_raw = (new_raw[:m.start()] + "aesop_collect"
-                       + orig[len("aesop"):] + new_raw[m.end():])
-        lines[i] = new_raw
-
-    return "".join(lines)
-
 
 def run_lean(
     path: Path,
@@ -186,6 +153,15 @@ def main() -> int:
             print(f"  exit={exit_code}  elapsed={elapsed:.1f}s  timed_out={timed_out}",
                   file=sys.stderr)
 
+            # Transient retry: a single crash may be an OOM from prior parallel load.
+            if not timed_out and exit_code == 139:
+                print("  Transient crash — retrying once at same stack ...", file=sys.stderr)
+                output, exit_code, elapsed, timed_out = run_lean(
+                    temp_path, project_root, args.timeout,
+                    extra_args=["--tstack", str(STACK_KB)],
+                )
+                print(f"  exit={exit_code}  elapsed={elapsed:.1f}s", file=sys.stderr)
+
             if not timed_out and exit_code != 139:
                 messages  = parse_aesop_collect_messages(output)
                 all_calls = [c for d in decls for c in d["aesop_calls"]]
@@ -223,6 +199,16 @@ def main() -> int:
                 )
                 messages = parse_aesop_collect_messages(output)
                 n_calls  = len(decl["aesop_calls"])
+
+                # Transient retry before escalating stack size
+                if exit_code == 139 and not timed_out:
+                    temp_path.write_text(truncated_patched, encoding="utf-8")
+                    output2, exit_code2, elapsed2, timed_out2 = run_lean(
+                        temp_path, project_root, args.timeout,
+                        extra_args=["--tstack", str(STACK_KB)],
+                    )
+                    if not timed_out2 and exit_code2 != 139:
+                        output, exit_code, elapsed = output2, exit_code2, elapsed2
 
                 # If still crashing with 64 MB stack, retry with 512 MB
                 if exit_code == 139 and not timed_out:

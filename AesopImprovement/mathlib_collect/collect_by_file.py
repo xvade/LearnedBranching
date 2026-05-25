@@ -247,6 +247,68 @@ def parse_aesop_collect_messages(output: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Helpers for per-declaration patching (used in crash retry)
+# ---------------------------------------------------------------------------
+
+def _run_lean_once(
+    path: Path,
+    project_root: Path,
+    timeout: float,
+    extra_args: list[str] | None = None,
+) -> tuple[str, int | None, float, bool]:
+    """Run `lake env lean [extra_args] path`. Returns (output, exit_code, elapsed, timed_out)."""
+    cmd = ["lake", "env", "lean"] + (extra_args or []) + [str(path)]
+    start = time.monotonic()
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(project_root),
+            text=True, capture_output=True, timeout=timeout,
+        )
+        return proc.stdout + proc.stderr, proc.returncode, time.monotonic() - start, False
+    except subprocess.TimeoutExpired as exc:
+        so = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout or b"").decode(errors="replace")
+        se = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr or b"").decode(errors="replace")
+        return so + se, None, time.monotonic() - start, True
+
+
+def patch_range_only(source: str, start_line: int, end_line: int) -> str:
+    """
+    Replace tactic-position `aesop` with `aesop_collect` only in lines
+    [start_line, end_line] (1-based, inclusive).  Lines outside the range
+    are left as plain `aesop` so they compile without the custom tactic.
+    """
+    lines  = source.splitlines(keepends=True)
+    masked = strip_comments_mask(lines)
+
+    for i, (raw, code) in enumerate(zip(lines, masked)):
+        lineno = i + 1
+        if lineno < start_line or lineno > end_line:
+            continue
+        matches = [
+            m for m in AESOP_CALL_RE.finditer(code)
+            if not code[:m.start()].rstrip().endswith(("@[", ","))
+            and _looks_like_tactic(code, m.start())
+        ]
+        if not matches:
+            continue
+        new_raw = raw
+        for m in reversed(matches):
+            orig    = new_raw[m.start():m.end()]
+            new_raw = (new_raw[:m.start()] + "aesop_collect"
+                       + orig[len("aesop"):] + new_raw[m.end():])
+        lines[i] = new_raw
+
+    return "".join(lines)
+
+
+def find_decl_end(decl_index: int, all_decls: list[dict], total_lines: int) -> int:
+    """Return the last line (1-based, inclusive) that belongs to decl_index."""
+    if decl_index + 1 < len(all_decls):
+        return all_decls[decl_index + 1]["start_line"] - 1
+    return total_lines
+
+
+# ---------------------------------------------------------------------------
 # Worker — process one Mathlib file
 # ---------------------------------------------------------------------------
 
@@ -312,7 +374,9 @@ def process_file(
 
     if timed_out:
         status = "timeout"
-    elif exit_code is not None and exit_code < 0:
+    elif exit_code is not None and (exit_code < 0 or exit_code == 139):
+        # exit_code < 0  : Python subprocess caught a Unix signal (e.g. -11 = SIGSEGV)
+        # exit_code == 139: Lean caught SIGSEGV internally and called exit(128+11)
         status = "crash"
     else:
         status = "ok"
@@ -322,6 +386,91 @@ def process_file(
         "exit_code":    exit_code,
         "elapsed_s":    round(elapsed, 2),
         "error":        error,
+        "declarations": decls,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Worker — process one file using per-declaration truncation
+# ---------------------------------------------------------------------------
+
+def process_file_per_decl(
+    rel_path:     str,
+    mathlib_root: Path,
+    project_root: Path,
+    temp_dir:     Path,
+    timeout:      float,
+) -> dict:
+    """
+    Process a Mathlib file declaration-by-declaration.
+
+    For each declaration that contains aesop calls:
+      - Truncate the source to the end of that declaration.
+      - Patch aesop→aesop_collect only within that declaration's line range.
+        Earlier declarations compile with plain `aesop` and emit no messages.
+      - Run lean once; the only aesop_collect messages in the output belong
+        to this declaration's calls.
+
+    This correctly handles `rw [...] <;> aesop` where one call site produces
+    multiple messages (one per sub-goal), unlike the positional matching in
+    `process_file` which breaks when any call emits >1 message.
+    """
+    orig_path = mathlib_root / rel_path
+    try:
+        source = orig_path.read_text(encoding="utf-8", errors="replace")
+    except Exception as exc:
+        return {"status": "error", "error": str(exc),
+                "exit_code": None, "elapsed_s": 0.0, "declarations": []}
+
+    decls       = scan_declarations(orig_path, mathlib_root)
+    total_lines = len(source.splitlines())
+
+    patched_path = temp_dir / rel_path
+    patched_path.parent.mkdir(parents=True, exist_ok=True)
+
+    final_status  = "ok"
+    final_exit: int | None = 0
+    total_elapsed = 0.0
+
+    for d_idx, decl in enumerate(decls):
+        if not decl["aesop_calls"]:
+            continue
+
+        start_line = decl["start_line"]
+        end_line   = find_decl_end(d_idx, decls, total_lines)
+        n_calls    = len(decl["aesop_calls"])
+
+        truncated_source  = "\n".join(source.splitlines()[:end_line]) + "\n"
+        truncated_patched = patch_range_only(truncated_source, start_line, end_line)
+
+        patched_path.write_text(truncated_patched, encoding="utf-8")
+        output, exit_code, elapsed, timed_out = _run_lean_once(
+            patched_path, project_root, timeout,
+        )
+        total_elapsed += elapsed
+
+        if timed_out:
+            final_status = "timeout"
+            final_exit   = None
+        elif exit_code is not None and (exit_code < 0 or exit_code == 139):
+            final_status = "crash"
+            final_exit   = exit_code
+        elif final_status == "ok":
+            final_exit = exit_code
+
+        messages = parse_aesop_collect_messages(output)
+        for i, call in enumerate(decl["aesop_calls"]):
+            if n_calls == 1:
+                # <;> combinator: single call site, potentially many messages
+                call["messages"] = messages
+            else:
+                call["messages"] = [messages[i]] if i < len(messages) else []
+
+    return {
+        "status":       final_status,
+        "exit_code":    final_exit,
+        "elapsed_s":    round(total_elapsed, 2),
+        "error":        None,
         "declarations": decls,
     }
 
@@ -338,7 +487,7 @@ def main() -> int:
     parser.add_argument("--mathlib",       default=MATHLIB_DEFAULT)
     parser.add_argument("--project",       default=str(HERE))
     parser.add_argument("--out",           default=str(HERE / "mathlib_by_file.json"))
-    parser.add_argument("--workers",       type=int,   default=4)
+    parser.add_argument("--workers",       type=int,   default=2)
     parser.add_argument("--timeout",       type=float, default=300.0)
     parser.add_argument("--retry-timeout", type=float, default=900.0)
     parser.add_argument("--max-files",     type=int,   default=0)
@@ -428,6 +577,36 @@ def main() -> int:
             )
             _run_pass(first_timeouts, args.retry_timeout,
                       max(1, args.workers // 2))
+
+        # Retry crashed files single-threaded using per-declaration patching.
+        # exit(139) crashes are often transient OOM from parallel memory pressure.
+        # Per-declaration truncation also correctly handles `<;> aesop` calls
+        # that emit multiple messages per site (positional matching in
+        # process_file would misalign them across the full message list).
+        crashed = [r for r, v in results.items() if v["status"] == "crash"]
+        if crashed:
+            print(
+                f"\nRetrying {len(crashed)} crashed file(s) single-threaded "
+                f"(timeout={args.retry_timeout}s) ...",
+                file=sys.stderr,
+            )
+            for i, rel in enumerate(crashed, 1):
+                rec = process_file_per_decl(
+                    rel, mathlib_root, project_root, temp_dir, args.retry_timeout,
+                )
+                results[rel] = rec
+                n_calls = sum(len(d["aesop_calls"]) for d in rec.get("declarations", []))
+                n_msgs  = sum(
+                    len(c["messages"])
+                    for d in rec.get("declarations", [])
+                    for c in d["aesop_calls"]
+                )
+                print(
+                    f"  [{i}/{len(crashed)}] {rel}: "
+                    f"{rec['status']}  calls={n_calls}  msgs={n_msgs}  "
+                    f"({rec.get('elapsed_s', 0):.1f}s)",
+                    file=sys.stderr,
+                )
 
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
